@@ -38,6 +38,63 @@ import time
 
 import smbus
 
+#  DS3232 Register Addresses
+RTC_SECONDS = 0x00
+RTC_MINUTES = 0x01
+RTC_HOURS = 0x02
+RTC_DAY = 0x03
+RTC_DATE = 0x04
+RTC_MONTH = 0x05
+RTC_YEAR = 0x06
+ALM1_SECONDS = 0x07
+ALM1_MINUTES = 0x08
+ALM1_HOURS = 0x09
+ALM1_DAYDATE = 0x0A
+ALM2_MINUTES = 0x0B
+ALM2_HOURS = 0x0C
+ALM2_DAYDATE = 0x0D
+RTC_CONTROL = 0x0E
+RTC_STATUS = 0x0F
+RTC_AGING = 0x10
+RTC_TEMP_MSB = 0x11
+RTC_TEMP_LSB = 0x12
+SRAM_START_ADDR = 0x14    #  first SRAM address
+SRAM_SIZE = 236           #  number of bytes of SRAM
+
+#  Alarm mask bits
+A1M1 = 7
+A1M2 = 7
+A1M3 = 7
+A1M4 = 7
+A2M2 = 7
+A2M3 = 7
+A2M4 = 7
+
+#  Control register bits
+EOSC = 7
+BBSQW = 6
+CONV = 5
+RS2 = 4
+RS1 = 3
+INTCN = 2
+A2IE = 1
+A1IE = 0
+
+#  Status register bits
+OSF = 7
+BB32KHZ = 6
+CRATE1 = 5
+CRATE0 = 4
+EN32KHZ = 3
+BSY = 2
+A2F = 1
+A1F = 0
+
+#  Other
+DS1307_CH = 7                #  for DS1307 compatibility, Clock Halt bit in Seconds register
+HR1224 = 6                   #  Hours register 12 or 24 hour mode (24 hour mode==0)
+CENTURY = 7                  #  Century bit in Month register
+DYDT = 6                     #  Day/Date flag bit in alarm Day/Date registers
 
 SECONDS_PER_MINUTE = 60
 MINUTES_PER_HOUR = 60
@@ -48,6 +105,9 @@ MONTHS_PER_YEAR = 12
 YEARS_PER_CENTURY = 100
 
 OSCILLATOR_ON_MASK = 0b1<<7
+
+def bv(n):
+    return (1<<n)
 
 def bcd_to_int(bcd, n=2):
     """Decode n least significant packed binary coded decimal digits to binary.
@@ -80,6 +140,29 @@ class SDL_DS3231():
         _REG_YEAR,
     ) = range(7)
 
+    (
+        SQWAVE_1_HZ,
+        SQWAVE_1024_HZ,
+        SQWAVE_4096_HZ,
+        SQWAVE_8192_HZ,
+        SQWAVE_NONE,
+    ) = range(5)
+
+    ALM1_EVERY_SECOND = 0x0F
+    ALM1_MATCH_SECONDS = 0x0E
+    ALM1_MATCH_MINUTES = 0x0C
+    ALM1_MATCH_HOURS = 0x08
+    ALM1_MATCH_DATE = 0x00
+    ALM1_MATCH_DAY = 0x10
+    ALM2_EVERY_MINUTE = 0x8E
+    ALM2_MATCH_MINUTES = 0x8C
+    ALM2_MATCH_HOURS = 0x88
+    ALM2_MATCH_DATE = 0x80
+    ALM2_MATCH_DAY = 0x90
+
+    ALARM_1 = 1                  #  constants for calling functions
+    ALARM_2 = 2
+
     ###########################
     # DS3231 Code
     # datasheet: https://datasheets.maximintegrated.com/en/ds/DS3231.pdf
@@ -110,7 +193,7 @@ class SDL_DS3231():
         """Return tuple of year, month, date, day, hours, minutes, seconds.
         Since each value is read one byte at a time,
         it might not be coherent."""
-        
+
         register_addresses = (
             self._REG_SECONDS,
             self._REG_MINUTES,
@@ -225,6 +308,109 @@ class SDL_DS3231():
         byte_tmsb = self._bus.read_byte_data(self._addr,0x11)
         byte_tlsb = bin(self._bus.read_byte_data(self._addr,0x12))[2:].zfill(8)
         return byte_tmsb+int(byte_tlsb[0])*2**(-1)+int(byte_tlsb[1])*2**(-2)
+
+    ###########################
+    # DS3231 ALARM Code
+    #
+    ###########################
+    #  ---------------------------------------------------------------------- *
+    #  * Set an alarm time. Sets the alarm registers only.  To cause the      *
+    #  * INT pin to be asserted on alarm match, use alarmInterrupt().         *
+    #  * This method can set either Alarm 1 or Alarm 2, depending on the      *
+    #  * value of alarmType (use a value from the ALARM_TYPES_t enumeration). *
+    #  * When setting Alarm 2, the seconds value must be supplied but is      *
+    #  * ignored, recommend using zero. (Alarm 2 has no seconds register.)    *
+    #  *----------------------------------------------------------------------*
+    def setAlarm(self, alarmType, seconds, minutes, hours, daydate):
+        addr = ALM1_SECONDS
+        seconds = int_to_bcd(seconds)
+        minutes = int_to_bcd(minutes)
+        hours = int_to_bcd(hours)
+        daydate = int_to_bcd(daydate)
+
+        if (alarmType & 0x01):
+            seconds |= bv(A1M1)
+
+        if (alarmType & 0x02):
+            minutes |= bv(A1M2)
+
+        if (alarmType & 0x04):
+            hours |= bv(A1M3)
+
+        if (alarmType & 0x10):
+            daydate |= bv(DYDT)
+
+        if (alarmType & 0x08):
+            daydate |= bv(A1M4)
+
+        if ( not (alarmType & 0x80) ):
+            addr = ALM1_SECONDS
+            self._write(addr, seconds)
+            addr += 1
+        else:
+            addr = ALM2_MINUTES
+
+        self._write(addr, minutes)
+        addr += 1
+        self._write(addr, hours)
+        addr += 1
+        self._write(addr, daydate)
+
+    #  *----------------------------------------------------------------------*
+    #  * Enable or disable an alarm "interrupt" which asserts the INT pin     *
+    #  * on the RTC.                                                          *
+    #  *----------------------------------------------------------------------*
+    def alarmInterrupt(self, alarmNumber, interruptEnabled):
+        controlReg = self._read(RTC_CONTROL)
+        mask = bv(A1IE) << (alarmNumber - 1)
+        if (interruptEnabled):
+            controlReg |= mask
+        else:
+            controlReg &= ~mask
+
+        self._write(RTC_CONTROL, controlReg)
+
+    #  *----------------------------------------------------------------------*
+    #  * Returns true or false depending on whether the given alarm has been  *
+    #  * triggered, and resets the alarm flag bit.                            *
+    #  *----------------------------------------------------------------------*
+    def alarm(self, alarmNumber):
+        statusReg = self._read(RTC_STATUS)
+        mask = bv(A1F) << (alarmNumber - 1)
+
+        if (statusReg & mask):
+            statusReg &= ~mask
+            self._write(RTC_STATUS, statusReg)
+            return True
+        else:
+            return False
+
+   #  *----------------------------------------------------------------------*
+   #  * Enable or disable the square wave output.                            *
+   #  * Use a value from the SQWAVE_FREQS_t enumeration for the parameter.   *
+   #  *----------------------------------------------------------------------*
+    def squareWave(self, freq):
+        controlReg = self._read(RTC_CONTROL)
+        if (freq >= self.SQWAVE_NONE):
+            controlReg |= bv(INTCN)
+        else:
+            controlReg = (controlReg & 0x03) | (freq << RS1)
+
+        self._write(RTC_CONTROL, controlReg)
+
+    #  *----------------------------------------------------------------------*
+    #  * Returns the value of the oscillator stop flag (OSF) bit in the       *
+    #  * control/status register which indicates that the oscillator is or    *
+    #  * was stopped, and that the timekeeping data may be invalid.           *
+    #  * Optionally clears the OSF bit depending on the argument passed.      *
+    #  *----------------------------------------------------------------------*
+    def oscStopped(self, clearOSF):
+        s = self._read(RTC_STATUS)  # read the status register
+        ret = s & bv(OSF)           # isolate the osc stop flag to return to caller
+        if (ret && clearOSF):       # clear OSF if it's set and the caller wants to clear it
+            self._write(RTC_STATUS, s & ~bv(OSF))
+
+        return ret
 
     ###########################
     # AT24C32 Code
