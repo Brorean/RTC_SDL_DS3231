@@ -407,7 +407,7 @@ class SDL_DS3231():
     def oscStopped(self, clearOSF):
         s = self._read(RTC_STATUS)  # read the status register
         ret = s & bv(OSF)           # isolate the osc stop flag to return to caller
-        if (ret && clearOSF):       # clear OSF if it's set and the caller wants to clear it
+        if (ret and clearOSF):       # clear OSF if it's set and the caller wants to clear it
             self._write(RTC_STATUS, s & ~bv(OSF))
 
         return ret
